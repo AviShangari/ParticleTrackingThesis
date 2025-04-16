@@ -1,0 +1,204 @@
+import cv2
+import numpy as np
+from skimage.morphology import skeletonize
+from skimage.graph import route_through_array
+from skimage.util import invert
+from scipy.ndimage import convolve
+from scipy.optimize import linear_sum_assignment
+import os
+
+#  CONFIGURATION 
+VIDEO_PATH = "./Tracking/vid2.mov"
+OUTPUT_DIR = "./Tracking/Output/worm_tracks"
+KEYPOINTS_PER_WORM = 15
+AREA_THRESHOLD = 50
+MAX_AGE = 35
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+#  UTILITIES 
+def preprocess_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 2)
+    binary = cv2.adaptiveThreshold(
+        blurred, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 3
+    )
+    return binary
+
+def extract_worm_masks(binary):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary)
+    masks = []
+    height = binary.shape[0]
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= AREA_THRESHOLD:
+            y = stats[i, cv2.CC_STAT_TOP]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            if y + h >= height - 5:
+                continue
+            mask = (labels == i).astype(np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+            masks.append(mask)
+    return masks
+
+def get_skeleton_points(mask, num_points):
+    mask_dilated = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    skeleton = skeletonize(mask_dilated > 0)
+
+    if np.count_nonzero(skeleton) < 2:
+        return None
+
+    kernel = np.ones((3, 3), dtype=int)
+    neighbor_count = convolve(skeleton.astype(int), kernel, mode='constant') * skeleton
+    endpoints = np.column_stack(np.where(neighbor_count == 2))
+
+    if len(endpoints) < 2:
+        return None
+
+    start = tuple(endpoints[0])
+    end = tuple(endpoints[-1])
+    try:
+        path, _ = route_through_array(invert(skeleton).astype(np.float32), start, end, fully_connected=True)
+    except Exception:
+        return None
+
+    path = np.array(path)
+    if len(path) < 2:
+        return None
+
+    indices = np.linspace(0, len(path) - 1, num=num_points, dtype=int)
+    return path[indices]
+
+def compute_cost_matrix(current_pts, prev_pts):
+    cost = np.zeros((len(prev_pts), len(current_pts)))
+    for i, prev in enumerate(prev_pts):
+        for j, curr in enumerate(current_pts):
+            centroid_dist = np.linalg.norm(np.mean(prev, axis=0) - np.mean(curr, axis=0))
+            shape_dist = np.mean(np.linalg.norm(prev - curr, axis=1))
+            cost[i, j] = 0.7 * centroid_dist + 0.3 * shape_dist
+    return cost
+
+def draw_tracks(frame, worm_keypoints, worm_ids):
+    keypoint_colors = [
+        (255, 0, 0), (255, 64, 0), (255, 128, 0), (255, 191, 0), (255, 255, 0),
+        (191, 255, 0), (128, 255, 0), (64, 255, 0), (0, 255, 0), (0, 255, 64),
+        (0, 255, 128), (0, 255, 191), (0, 255, 255), (0, 191, 255), (0, 128, 255)
+    ]
+    for i, points in enumerate(worm_keypoints):
+        for k, pt in enumerate(points):
+            color = keypoint_colors[k] if k < len(keypoint_colors) else (255, 255, 255)
+            x, y = int(pt[1]), int(pt[0])
+            cv2.circle(frame, (x, y), 4, color, -1)
+            if k > 0:
+                pt1 = (int(points[k - 1][1]), int(points[k - 1][0]))
+                pt2 = (int(pt[1]), int(pt[0]))
+                cv2.line(frame, pt1, pt2, color, 2)
+        worm_id = worm_ids[i]
+        cv2.putText(frame, f"ID {worm_id}", tuple(points[0][::-1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return frame
+
+#  MAIN PIPELINE 
+cap = cv2.VideoCapture(VIDEO_PATH)
+frame_idx = 0
+track_memory = []
+next_id = 0
+keypoint_tracks = {}
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    binary = preprocess_frame(frame)
+    masks = extract_worm_masks(binary)
+    current_keypoints = []
+
+    for mask in masks:
+        keypoints = get_skeleton_points(mask, KEYPOINTS_PER_WORM)
+        if keypoints is not None:
+            current_keypoints.append(keypoints)
+
+    current_ids = [-1] * len(current_keypoints)
+
+    if len(track_memory) > 0:
+        prev_keypoints = [t["keypoints"] for t in track_memory if t["age"] <= MAX_AGE]
+        prev_ids = [t["id"] for t in track_memory if t["age"] <= MAX_AGE]
+        cost = compute_cost_matrix(current_keypoints, prev_keypoints)
+        row_ind, col_ind = linear_sum_assignment(cost)
+
+        for i, j in zip(row_ind, col_ind):
+            if i < len(prev_keypoints) and j < len(current_keypoints):
+                if cost[i, j] < 80:
+                    prev_vec = prev_keypoints[i][-1] - prev_keypoints[i][0]
+                    curr_vec = current_keypoints[j][-1] - current_keypoints[j][0]
+                    if np.dot(prev_vec, curr_vec) < 0:
+                        current_keypoints[j] = current_keypoints[j][::-1]
+                    current_ids[j] = prev_ids[i]
+
+    for j in range(len(current_keypoints)):
+        if current_ids[j] == -1:
+            curr_centroid = np.mean(current_keypoints[j], axis=0)
+            too_close = False
+            for track in track_memory:
+                prev_centroid = np.mean(track["keypoints"], axis=0)
+                if np.linalg.norm(curr_centroid - prev_centroid) < 50:
+                    too_close = True
+                    break
+            if not too_close:
+                current_ids[j] = next_id
+                next_id += 1
+            else:
+                current_keypoints[j] = None
+
+    filtered_ids = []
+    filtered_keypoints = []
+    for cid, kp in zip(current_ids, current_keypoints):
+        if kp is not None and cid != -1:
+            filtered_ids.append(cid)
+            filtered_keypoints.append(kp)
+    current_ids = filtered_ids
+    current_keypoints = filtered_keypoints
+
+    updated_tracks = []
+    for tid, kps in zip(current_ids, current_keypoints):
+        updated_tracks.append({"id": tid, "keypoints": kps, "age": 0})
+
+    for old_track in track_memory:
+        if old_track["id"] not in current_ids and old_track["age"] < MAX_AGE:
+            updated_tracks.append({"id": old_track["id"], "keypoints": old_track["keypoints"], "age": old_track["age"] + 1})
+
+    track_memory = updated_tracks
+
+    for worm_id, keypoints in zip(current_ids, current_keypoints):
+        if worm_id not in keypoint_tracks:
+            keypoint_tracks[worm_id] = [[] for _ in range(KEYPOINTS_PER_WORM)]
+        for i in range(KEYPOINTS_PER_WORM):
+            keypoint_tracks[worm_id][i].append(keypoints[i])
+
+    annotated = draw_tracks(frame.copy(), current_keypoints, current_ids)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, f"frame_{frame_idx:04d}.png"), annotated)
+    frame_idx += 1
+
+cap.release()
+
+#  Video generation 
+output_video_path = os.path.join("./Tracking/Output/Skeletal_Tracking", "skeleton_tracked_video2-2.mp4")
+os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
+image_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith(".png")])
+
+if image_files:
+    first_image = cv2.imread(os.path.join(OUTPUT_DIR, image_files[0]))
+    height, width, _ = first_image.shape
+    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 60, (width, height))
+
+    for filename in image_files:
+        frame = cv2.imread(os.path.join(OUTPUT_DIR, filename))
+        out.write(frame)
+
+    out.release()
+    print(f"Tracking complete. Frames saved in: {OUTPUT_DIR}")
+    print(f"Video saved as: {output_video_path}")
+else:
+    print("No frames were saved, so no video was generated.")
